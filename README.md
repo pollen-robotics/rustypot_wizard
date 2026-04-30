@@ -6,20 +6,46 @@ and [Ratatui](https://ratatui.rs/).
 
 ## Install
 
-Pre-built binaries for Linux (x86_64 / aarch64), macOS (x86_64 / arm64) and
-Windows are published on the [Releases page](https://github.com/pollen-robotics/rustypot_wizard/releases).
-
-A one-line installer is provided per release:
+### Linux / macOS
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/pollen-robotics/rustypot_wizard/releases/latest/download/rustypot_wizard-installer.sh | sh
+curl -LsSf https://github.com/pollen-robotics/rustypot_wizard/releases/latest/download/rustypot_wizard-installer.sh | sh
 ```
 
-Or via cargo:
+### Windows (PowerShell)
+
+```powershell
+irm https://github.com/pollen-robotics/rustypot_wizard/releases/latest/download/rustypot_wizard-installer.ps1 | iex
+```
+
+The installer drops the binary in `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin`)
+and adds it to your `PATH` if needed. No Rust toolchain required.
+
+### Pinning a version
+
+Replace `latest` with a tag, e.g. `download/v0.1.0/`:
+
+```sh
+curl -LsSf https://github.com/pollen-robotics/rustypot_wizard/releases/download/v0.1.0/rustypot_wizard-installer.sh | sh
+```
+
+### From source
 
 ```sh
 cargo install --git https://github.com/pollen-robotics/rustypot_wizard
+```
+
+Or download a tarball/zip directly from the
+[Releases page](https://github.com/pollen-robotics/rustypot_wizard/releases)
+(builds: linux x86_64/aarch64, macOS x86_64/arm64, windows x86_64).
+
+### Linux serial-port permissions
+
+To talk to a USB-serial adapter without `sudo`, add yourself to the `dialout`
+group (Debian/Ubuntu) or `uucp` (Arch), then log out/in:
+
+```sh
+sudo usermod -aG dialout "$USER"
 ```
 
 ## Usage
