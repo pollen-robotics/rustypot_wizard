@@ -1,5 +1,7 @@
 # rustypot_wizard
 
+<img width="2560" height="1528" alt="Capture d’écran du 2026-04-30 10-43-01" src="https://github.com/user-attachments/assets/ba2fc73c-8629-4768-a04f-6eb6b2be2b57" />
+
 Terminal UI to detect, inspect and configure Dynamixel and Feetech servos
 over a serial bus, built on top of [`rustypot`](https://crates.io/crates/rustypot)
 and [Ratatui](https://ratatui.rs/).
