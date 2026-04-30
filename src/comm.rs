@@ -48,7 +48,10 @@ pub fn list_ports() -> Vec<String> {
                 .map(|p| p.port_name)
                 .filter(|name| {
                     let base = name.rsplit('/').next().unwrap_or(name);
-                    base.starts_with("ttyACM") || base.starts_with("ttyUSB")
+                    base.starts_with("ttyACM")
+                        || base.starts_with("ttyUSB")
+                        || base.starts_with("ttyAMA")
+                        || base.starts_with("ttyS")
                 })
                 .collect()
         })
