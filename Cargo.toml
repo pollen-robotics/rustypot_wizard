@@ -2,6 +2,11 @@
 name = "rustypot_wizard"
 version = "0.1.0"
 edition = "2021"
+description = "TUI configurator for Dynamixel and Feetech servos, powered by rustypot."
+license = "Apache-2.0"
+repository = "https://github.com/pollen-robotics/rustypot_wizard"
+homepage = "https://github.com/pollen-robotics/rustypot_wizard"
+readme = "README.md"
 
 [dependencies]
 ratatui = "0.29"
@@ -9,3 +14,8 @@ crossterm = "0.28"
 serialport = { version = "4.2", default-features = false }
 rustypot = "1.4"
 anyhow = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
