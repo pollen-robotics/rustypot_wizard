@@ -1,6 +1,6 @@
 [package]
 name = "rustypot_wizard"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "TUI configurator for Dynamixel and Feetech servos, powered by rustypot."
 license = "Apache-2.0"
