@@ -1,0 +1,11 @@
+[package]
+name = "rustypot_wizard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serialport = { version = "4.2", default-features = false }
+rustypot = "1.4"
+anyhow = "1"
