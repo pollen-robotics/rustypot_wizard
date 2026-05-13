@@ -84,6 +84,12 @@ pub struct App {
     pub scan: Option<ScanProgress>,
     pub last_live: Option<Instant>,
     pub hits: RefCell<Vec<HitZone>>,
+    pub confirm: Option<ConfirmAction>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ConfirmAction {
+    FactoryReset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +110,10 @@ pub enum Hit {
     /// Click on the goal slider — value chosen by the x ratio inside the rect.
     GoalSlider,
     EditGoal,
+    Reboot,
+    FactoryReset,
+    ConfirmYes,
+    ConfirmNo,
 }
 
 pub struct ScanProgress {
@@ -154,6 +164,7 @@ impl App {
             scan: None,
             last_live: None,
             hits: RefCell::new(Vec::new()),
+            confirm: None,
         }
     }
 
@@ -649,6 +660,68 @@ impl App {
                 self.set_goal_ratio(dx / span);
             }
             Hit::EditGoal => self.start_edit_goal(),
+            Hit::Reboot => self.reboot_selected(),
+            Hit::FactoryReset => self.request_factory_reset(),
+            Hit::ConfirmYes => self.commit_confirm(),
+            Hit::ConfirmNo => self.cancel_confirm(),
+        }
+    }
+
+    pub fn reboot_selected(&mut self) {
+        let Some(motor) = self.selected_motor() else {
+            return;
+        };
+        let id = motor.id;
+        let Some(bus) = self.bus.as_mut() else { return };
+        match bus.reboot(id) {
+            Ok(()) => {
+                self.status = format!("Reboot sent to id {}.", id);
+                self.reg_values.clear();
+            }
+            Err(e) => self.status = format!("Reboot failed: {}", e),
+        }
+    }
+
+    pub fn request_factory_reset(&mut self) {
+        if self.selected_motor().is_none() {
+            return;
+        }
+        self.confirm = Some(ConfirmAction::FactoryReset);
+        self.status = "Factory reset?  Enter/y confirm, Esc/n cancel.".into();
+    }
+
+    pub fn cancel_confirm(&mut self) {
+        self.confirm = None;
+        self.status = "Cancelled.".into();
+    }
+
+    pub fn commit_confirm(&mut self) {
+        let Some(action) = self.confirm.take() else {
+            return;
+        };
+        match action {
+            ConfirmAction::FactoryReset => self.do_factory_reset(),
+        }
+    }
+
+    fn do_factory_reset(&mut self) {
+        let Some(motor) = self.selected_motor() else {
+            return;
+        };
+        let id = motor.id;
+        // For V2 keep ID + baud so we stay in contact. For V1 the protocol
+        // does not support conservation flags — pass false/false.
+        let (conserve_id, conserve_id_and_baud) = match self.protocol {
+            Protocol::V1 => (false, false),
+            Protocol::V2 => (false, true),
+        };
+        let Some(bus) = self.bus.as_mut() else { return };
+        match bus.factory_reset(id, conserve_id, conserve_id_and_baud) {
+            Ok(()) => {
+                self.status = format!("Factory reset sent to id {}.", id);
+                self.reg_values.clear();
+            }
+            Err(e) => self.status = format!("Factory reset failed: {}", e),
         }
     }
 
@@ -656,7 +729,11 @@ impl App {
     /// Called from the main loop on a timer; values are written into
     /// `reg_values` so both the right panel and the register table see them.
     pub fn tick_live(&mut self) {
-        if self.scan.is_some() || self.editing.is_some() || self.bus.is_none() {
+        if self.scan.is_some()
+            || self.editing.is_some()
+            || self.confirm.is_some()
+            || self.bus.is_none()
+        {
             return;
         }
         let now = Instant::now();

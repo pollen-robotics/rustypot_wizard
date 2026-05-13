@@ -38,6 +38,29 @@ impl Bus {
             .write(self.port.as_mut(), id, addr, data)
             .map_err(|e| anyhow!("write failed: {}", e))
     }
+
+    pub fn reboot(&mut self, id: u8) -> Result<()> {
+        self.dph
+            .reboot(self.port.as_mut(), id)
+            .map(|_| ())
+            .map_err(|e| anyhow!("reboot failed: {}", e))
+    }
+
+    pub fn factory_reset(
+        &mut self,
+        id: u8,
+        conserve_id_only: bool,
+        conserve_id_and_baudrate: bool,
+    ) -> Result<()> {
+        self.dph
+            .factory_reset(
+                self.port.as_mut(),
+                id,
+                conserve_id_only,
+                conserve_id_and_baudrate,
+            )
+            .map_err(|e| anyhow!("factory reset failed: {}", e))
+    }
 }
 
 pub fn list_ports() -> Vec<String> {

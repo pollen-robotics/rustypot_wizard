@@ -102,6 +102,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         handle_edit_key(app, code);
         return;
     }
+    if app.confirm.is_some() {
+        handle_confirm_key(app, code);
+        return;
+    }
     match app.mode {
         Mode::Setup => handle_setup_key(app, code, mods),
         Mode::Main => handle_main_key(app, code, mods),
@@ -180,7 +184,17 @@ fn handle_main_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('l') => app.nudge_goal(1),
         KeyCode::Char('H') => app.nudge_goal(-50),
         KeyCode::Char('L') => app.nudge_goal(50),
-        KeyCode::Char('g') | KeyCode::Char('G') => app.start_edit_goal(),
+        KeyCode::Char('g') => app.start_edit_goal(),
+        KeyCode::Char('b') | KeyCode::Char('B') => app.reboot_selected(),
+        KeyCode::Char('F') => app.request_factory_reset(),
+        _ => {}
+    }
+}
+
+fn handle_confirm_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => app.commit_confirm(),
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.cancel_confirm(),
         _ => {}
     }
 }

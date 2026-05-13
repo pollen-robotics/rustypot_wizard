@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, FocusedPane, Hit, HitZone, Mode, SetupField};
+use crate::app::{App, ConfirmAction, FocusedPane, Hit, HitZone, Mode, SetupField};
 use crate::registers::{decode_value, Access, Brand, Protocol, Reg, RegType, COMMON_BAUDRATES};
 
 const ACCENT: Color = Color::Cyan;
@@ -41,6 +41,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if app.editing.is_some() {
         draw_edit_modal(f, area, app);
+    }
+    if let Some(action) = app.confirm {
+        draw_confirm_modal(f, area, app, action);
     }
 }
 
@@ -466,6 +469,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(8),  // live readings
             Constraint::Length(2),  // torque toggle
             Constraint::Length(5),  // goal slider
+            Constraint::Length(2),  // danger buttons
             Constraint::Min(2),     // hints
         ])
         .split(inner);
@@ -637,10 +641,58 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
+    // Danger zone — Reboot + Factory Reset
+    let danger_label = Line::from(vec![
+        Span::styled(
+            "Danger  ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            " Reboot ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(120, 80, 20))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            " Factory Reset ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(120, 30, 30))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(danger_label), v[4]);
+    // Hit zones — approximate positions of the two button spans.
+    let dz_y = v[4].y;
+    let dz_x = v[4].x;
+    let reboot_x = dz_x.saturating_add(8); // after "Danger  "
+    add_zone(
+        app,
+        Rect {
+            x: reboot_x,
+            y: dz_y,
+            width: 8,
+            height: 1,
+        },
+        Hit::Reboot,
+    );
+    add_zone(
+        app,
+        Rect {
+            x: reboot_x.saturating_add(10),
+            y: dz_y,
+            width: 15,
+            height: 1,
+        },
+        Hit::FactoryReset,
+    );
+
     // Hints
     let hints = Paragraph::new(vec![
         Line::from(Span::styled(
-            "[t] torque   [h/l] ±1   [H/L] ±50   [g] set goal",
+            "[t] torque  [h/l] ±1  [H/L] ±50  [g] set goal  [b] reboot  [F] factory",
             Style::default().fg(Color::Gray),
         )),
         Line::from(Span::styled(
@@ -649,7 +701,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
         )),
     ])
     .wrap(Wrap { trim: true });
-    f.render_widget(hints, v[4]);
+    f.render_widget(hints, v[5]);
 }
 
 fn draw_edit_modal(f: &mut Frame, area: Rect, app: &App) {
@@ -695,6 +747,87 @@ fn draw_edit_modal(f: &mut Frame, area: Rect, app: &App) {
     ])
     .alignment(Alignment::Left);
     f.render_widget(p, inner);
+}
+
+fn draw_confirm_modal(f: &mut Frame, area: Rect, app: &App, action: ConfirmAction) {
+    let (title, body) = match action {
+        ConfirmAction::FactoryReset => {
+            let id = app.selected_motor().map(|m| m.id).unwrap_or(0);
+            (
+                " Factory Reset ",
+                format!(
+                    "Reset all registers of motor ID {} to factory defaults?\n\
+                     (ID and baud rate will be preserved on V2.)",
+                    id
+                ),
+            )
+        }
+    };
+    let w = 60.min(area.width.saturating_sub(4));
+    let h = 8.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(220, 100, 100)))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(120, 30, 30))
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = body
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Yes (Enter/y)  ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(120, 30, 30))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            "  No (Esc/n)  ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+
+    // Buttons sit on the last rendered line.
+    let btn_y = inner.y + inner.height.saturating_sub(1);
+    add_zone(
+        app,
+        Rect {
+            x: inner.x,
+            y: btn_y,
+            width: 17,
+            height: 1,
+        },
+        Hit::ConfirmYes,
+    );
+    add_zone(
+        app,
+        Rect {
+            x: inner.x.saturating_add(20),
+            y: btn_y,
+            width: 14,
+            height: 1,
+        },
+        Hit::ConfirmNo,
+    );
 }
 
 fn bordered_block(title: &str, focused: bool) -> Block<'_> {
