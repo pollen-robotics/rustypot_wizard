@@ -5,6 +5,7 @@ use std::time::Instant;
 use ratatui::layout::Rect;
 
 use crate::comm::{list_ports, Bus};
+use crate::config::{load_last_port, save_last_port};
 use crate::registers::{
     decode_value, default_regs, encode_value, lookup_model, model_number_addr, Brand, Model,
     MotorControl, Protocol, Reg, COMMON_BAUDRATES,
@@ -139,6 +140,9 @@ pub struct EditState {
 impl App {
     pub fn new() -> Self {
         let ports = list_ports();
+        let port_idx = load_last_port()
+            .and_then(|saved| ports.iter().position(|p| p == &saved))
+            .unwrap_or(0);
         let baud_idx = COMMON_BAUDRATES
             .iter()
             .position(|&b| b == 1_000_000)
@@ -148,7 +152,7 @@ impl App {
             setup_focus: 0,
             brand: Brand::Dynamixel,
             ports,
-            port_idx: 0,
+            port_idx,
             baud_idx,
             protocol: Protocol::V2,
             scan_max: 255,
@@ -242,6 +246,7 @@ impl App {
         match Bus::open(&port, baud, protocol) {
             Ok(bus) => {
                 self.bus = Some(bus);
+                save_last_port(&port);
                 self.status = format!("Opened {} @ {} bps. Scanning…", port, baud);
                 self.start_scan();
                 self.mode = Mode::Main;

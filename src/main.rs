@@ -1,5 +1,6 @@
 mod app;
 mod comm;
+mod config;
 mod registers;
 mod ui;
 
