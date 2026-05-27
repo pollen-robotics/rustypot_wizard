@@ -64,19 +64,41 @@ impl Bus {
 }
 
 pub fn list_ports() -> Vec<String> {
-    serialport::available_ports()
+    fn is_serial(base: &str) -> bool {
+        base.starts_with("ttyACM")
+            || base.starts_with("ttyUSB")
+            || base.starts_with("ttyAMA")
+            || base.starts_with("ttyS")
+    }
+
+    let mut ports: Vec<String> = serialport::available_ports()
         .map(|ports| {
             ports
                 .into_iter()
                 .map(|p| p.port_name)
-                .filter(|name| {
-                    let base = name.rsplit('/').next().unwrap_or(name);
-                    base.starts_with("ttyACM")
-                        || base.starts_with("ttyUSB")
-                        || base.starts_with("ttyAMA")
-                        || base.starts_with("ttyS")
-                })
+                .filter(|name| is_serial(name.rsplit('/').next().unwrap_or(name)))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // Fallback: libudev (which `available_ports` uses on Linux) only enumerates
+    // serial devices that have an entry in the `tty` subsystem and a parent
+    // device declared in udev — typically USB serial converters. Built-in
+    // platform UARTs like /dev/ttyS2 on Rockchip / Allwinner SBCs aren't
+    // discovered. Scan /dev directly and union the results.
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let base = name.to_string_lossy();
+            if is_serial(&base) {
+                let full = format!("/dev/{base}");
+                if !ports.contains(&full) {
+                    ports.push(full);
+                }
+            }
+        }
+    }
+
+    ports.sort();
+    ports
 }
