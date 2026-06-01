@@ -65,10 +65,15 @@ impl Bus {
 
 pub fn list_ports() -> Vec<String> {
     fn is_serial(base: &str) -> bool {
+        // Linux: USB converters and built-in platform UARTs.
         base.starts_with("ttyACM")
             || base.starts_with("ttyUSB")
             || base.starts_with("ttyAMA")
             || base.starts_with("ttyS")
+            // macOS: USB serial callout (cu.*) and dial-in (tty.*) nodes.
+            // Match USB devices only to skip Bluetooth-* and other tty.* nodes.
+            || base.starts_with("cu.usb")
+            || base.starts_with("tty.usb")
     }
 
     let mut ports: Vec<String> = serialport::available_ports()
