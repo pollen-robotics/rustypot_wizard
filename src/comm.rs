@@ -39,6 +39,20 @@ impl Bus {
             .map_err(|e| anyhow!("write failed: {}", e))
     }
 
+    /// Read the same register from many ids in one bus transaction.
+    pub fn sync_read(&mut self, ids: &[u8], addr: u8, length: u8) -> Result<Vec<Vec<u8>>> {
+        self.dph
+            .sync_read(self.port.as_mut(), ids, addr, length)
+            .map_err(|e| anyhow!("sync_read failed: {}", e))
+    }
+
+    /// Write per-id values to the same register in one bus transaction (no status response).
+    pub fn sync_write(&mut self, ids: &[u8], addr: u8, data: &[Vec<u8>]) -> Result<()> {
+        self.dph
+            .sync_write(self.port.as_mut(), ids, addr, data)
+            .map_err(|e| anyhow!("sync_write failed: {}", e))
+    }
+
     pub fn reboot(&mut self, id: u8) -> Result<()> {
         self.dph
             .reboot(self.port.as_mut(), id)

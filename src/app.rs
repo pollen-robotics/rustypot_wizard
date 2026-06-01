@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 
+use crate::bench::{BenchIo, BenchKind, BenchResult, BenchRun, Stats};
 use crate::comm::{list_ports, Bus};
 use crate::config::{load_last_port, save_last_port};
 use crate::registers::{
@@ -15,6 +16,7 @@ use crate::registers::{
 pub enum Mode {
     Setup,
     Main,
+    Bench,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,23 @@ pub struct App {
     pub last_live: Option<Instant>,
     pub hits: RefCell<Vec<HitZone>>,
     pub confirm: Option<ConfirmAction>,
+
+    // Benchmark state
+    pub bench_idx: usize,
+    pub bench_secs: f64,
+    pub bench_amp_deg: f64,
+    pub bench_freq_hz: f64,
+    pub bench_run: Option<BenchRun>,
+    pub bench_results: HashMap<BenchKindKey, BenchResult>,
+    /// Pending benchmarks to run back-to-back (populated by "run all").
+    pub bench_queue: Vec<BenchKind>,
+}
+
+/// `BenchKind` is not `Hash`; use its discriminant as a stable map key.
+pub type BenchKindKey = usize;
+
+pub fn bench_key(kind: BenchKind) -> BenchKindKey {
+    BenchKind::ALL.iter().position(|k| *k == kind).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +134,9 @@ pub enum Hit {
     FactoryReset,
     ConfirmYes,
     ConfirmNo,
+    BenchIdx(usize),
+    RunBench,
+    RunAllBench,
 }
 
 pub struct ScanProgress {
@@ -169,6 +191,13 @@ impl App {
             last_live: None,
             hits: RefCell::new(Vec::new()),
             confirm: None,
+            bench_idx: 0,
+            bench_secs: 10.0,
+            bench_amp_deg: 5.0,
+            bench_freq_hz: 0.5,
+            bench_run: None,
+            bench_results: HashMap::new(),
+            bench_queue: Vec::new(),
         }
     }
 
@@ -669,6 +698,13 @@ impl App {
             Hit::FactoryReset => self.request_factory_reset(),
             Hit::ConfirmYes => self.commit_confirm(),
             Hit::ConfirmNo => self.cancel_confirm(),
+            Hit::BenchIdx(i) => {
+                if i < BenchKind::ALL.len() {
+                    self.bench_idx = i;
+                }
+            }
+            Hit::RunBench => self.start_selected_bench(),
+            Hit::RunAllBench => self.run_all_bench(),
         }
     }
 
@@ -760,6 +796,338 @@ impl App {
                 .read(id, reg.addr as u8, reg.ty.len())
                 .map_err(|e| e.to_string());
             self.reg_values.insert(reg.addr, res);
+        }
+    }
+
+    // ---------------- Benchmarks ----------------
+
+    pub fn open_bench(&mut self) {
+        if self.motors.is_empty() {
+            self.status = "Scan for motors before benchmarking (press s).".into();
+            return;
+        }
+        if self.scan.is_some() {
+            self.stop_scan();
+        }
+        self.mode = Mode::Bench;
+        self.status = "Benchmark — ↑↓ select, Enter run, a run all, Esc back.".into();
+    }
+
+    pub fn selected_bench(&self) -> BenchKind {
+        BenchKind::ALL[self.bench_idx.min(BenchKind::ALL.len() - 1)]
+    }
+
+    pub fn move_bench(&mut self, delta: i32) {
+        let n = BenchKind::ALL.len() as i32;
+        self.bench_idx = (self.bench_idx as i32 + delta).rem_euclid(n) as usize;
+    }
+
+    pub fn adjust_secs(&mut self, up: bool) {
+        // Step in a friendly progression of run durations (seconds).
+        const STEPS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0];
+        let cur = self.bench_secs;
+        if up {
+            self.bench_secs = STEPS
+                .iter()
+                .copied()
+                .find(|&s| s > cur + 0.001)
+                .unwrap_or(120.0);
+        } else {
+            self.bench_secs = STEPS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&s| s < cur - 0.001)
+                .unwrap_or(1.0);
+        }
+    }
+
+    pub fn adjust_amp(&mut self, delta: f64) {
+        self.bench_amp_deg = (self.bench_amp_deg + delta).clamp(0.0, 45.0);
+    }
+
+    /// Resolve register addresses from the selected motor's model (homogeneous-bus assumption).
+    fn bench_io(&self) -> BenchIo {
+        let ctl = self.motor_control();
+        let deg_per_count = self
+            .selected_motor()
+            .and_then(|m| m.model)
+            .map(|m| m.deg_per_count)
+            .unwrap_or(360.0 / 4096.0);
+        let (pos_addr, pos_ty, has_pos) = match ctl.present_position {
+            Some(r) => (r.addr as u8, r.ty, true),
+            None => (0, crate::registers::RegType::I32, false),
+        };
+        let (goal_addr, goal_ty, has_goal) = match ctl.goal_position {
+            Some(r) => (r.addr as u8, r.ty, true),
+            None => (0, crate::registers::RegType::I32, false),
+        };
+        let (torque_addr, torque_ty, has_torque) = match ctl.torque_enable {
+            Some(r) => (r.addr as u8, r.ty, true),
+            None => (0, crate::registers::RegType::Bool, false),
+        };
+        BenchIo {
+            pos_addr,
+            pos_ty,
+            has_pos,
+            goal_addr,
+            goal_ty,
+            has_goal,
+            torque_addr,
+            torque_ty,
+            has_torque,
+            deg_per_count,
+        }
+    }
+
+    /// Write the torque-enable register on every involved motor (sine runs only).
+    fn set_torque(&mut self, ids: &[u8], io: BenchIo, on: bool) {
+        if !io.has_torque {
+            return;
+        }
+        let bytes = encode_value(on as i64, io.torque_ty);
+        if let Some(bus) = self.bus.as_mut() {
+            for &id in ids {
+                let _ = bus.write(id, io.torque_addr, &bytes);
+            }
+        }
+    }
+
+    pub fn run_all_bench(&mut self) {
+        if self.bench_run.is_some() {
+            return;
+        }
+        self.bench_queue = BenchKind::ALL.to_vec();
+        let first = self.bench_queue.remove(0);
+        self.start_bench(first);
+    }
+
+    pub fn start_selected_bench(&mut self) {
+        if self.bench_run.is_some() {
+            return;
+        }
+        self.bench_queue.clear();
+        let kind = self.selected_bench();
+        self.start_bench(kind);
+    }
+
+    fn start_bench(&mut self, kind: BenchKind) {
+        let io = self.bench_io();
+        // Every benchmark except the pings needs a Present Position register.
+        if !io.has_pos && !matches!(kind, BenchKind::PingOne | BenchKind::PingAll) {
+            self.status = "No Present Position register on this model.".into();
+            self.bench_queue.clear();
+            return;
+        }
+        if kind.writes() && !io.has_goal {
+            self.status = "No Goal Position register on this model.".into();
+            self.bench_queue.clear();
+            return;
+        }
+
+        let ids: Vec<u8> = if kind.uses_all() {
+            self.motors.iter().map(|m| m.id).collect()
+        } else {
+            match self.selected_motor() {
+                Some(m) => vec![m.id],
+                None => {
+                    self.status = "No motor selected.".into();
+                    return;
+                }
+            }
+        };
+
+        // Capture each motor's resting position once: it is the goal for "hold"
+        // runs and the sine centre for "sine" runs, and is restored on finish.
+        // Abort rather than risk commanding a bogus goal if a read fails.
+        let mut home = Vec::with_capacity(ids.len());
+        if kind.writes() {
+            let Some(bus) = self.bus.as_mut() else { return };
+            for &id in &ids {
+                match bus.read(id, io.pos_addr, io.pos_ty.len()) {
+                    Ok(bytes) => home.push(decode_value(&bytes, io.pos_ty) as i32),
+                    Err(_) => {
+                        self.status =
+                            format!("Could not read position of id {id}; aborting R/W benchmark.");
+                        self.bench_queue.clear();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Sine runs command motion, so enable torque for the duration (it is
+        // disabled again in finish_bench). Hold runs do not move and are left
+        // untouched. Warn if the model has no torque register to drive.
+        if kind.moving() {
+            if io.has_torque {
+                self.set_torque(&ids, io, true);
+            } else {
+                self.status = "No Torque Enable register — motors may not move.".into();
+            }
+        }
+
+        self.bench_run = Some(BenchRun {
+            kind,
+            duration_secs: self.bench_secs,
+            done: 0,
+            stats: Stats::default(),
+            ids,
+            io,
+            home,
+            amp_deg: self.bench_amp_deg,
+            freq_hz: self.bench_freq_hz,
+            started: Instant::now(),
+        });
+        let extra = if kind.moving() && io.has_torque {
+            " (torque on)"
+        } else {
+            ""
+        };
+        self.status = format!(
+            "Running: {} for {:.0}s{}…",
+            kind.title(),
+            self.bench_secs,
+            extra
+        );
+    }
+
+    pub fn stop_bench(&mut self) {
+        if self.bench_run.is_none() {
+            return;
+        }
+        self.bench_queue.clear();
+        self.finish_bench();
+        self.status = "Benchmark stopped.".into();
+    }
+
+    /// Run a single cycle of the active benchmark. Returns true while still running.
+    pub fn tick_bench(&mut self) -> bool {
+        if self.bench_run.as_ref().is_none_or(|r| r.is_done()) {
+            self.finish_bench();
+            return false;
+        }
+        self.run_one_cycle();
+        if self.bench_run.as_ref().is_none_or(|r| r.is_done()) {
+            self.finish_bench();
+            return false;
+        }
+        true
+    }
+
+    fn run_one_cycle(&mut self) {
+        // Disjoint borrows of two distinct Option fields.
+        let (Some(run), Some(bus)) = (self.bench_run.as_mut(), self.bus.as_mut()) else {
+            return;
+        };
+        let t = run.started.elapsed().as_secs_f64();
+        let io = run.io;
+        let mut errors = 0usize;
+        let started = Instant::now();
+
+        match run.kind {
+            BenchKind::PingOne | BenchKind::PingAll => {
+                for &id in &run.ids {
+                    if !bus.ping(id) {
+                        errors += 1;
+                    }
+                }
+            }
+            BenchKind::ReadOnePos | BenchKind::ReadAllSeq => {
+                for &id in &run.ids {
+                    if bus.read(id, io.pos_addr, io.pos_ty.len()).is_err() {
+                        errors += 1;
+                    }
+                }
+            }
+            BenchKind::ReadAllSync => {
+                match bus.sync_read(&run.ids, io.pos_addr, io.pos_ty.len()) {
+                    Ok(v) if v.len() == run.ids.len() && v.iter().all(|b| !b.is_empty()) => {}
+                    _ => errors += run.ids.len(),
+                }
+            }
+            BenchKind::RwHoldSeq | BenchKind::RwSineSeq => {
+                let moving = run.kind.moving();
+                for (i, &id) in run.ids.iter().enumerate() {
+                    let goal = run.goal(i, t, moving);
+                    let bytes = encode_value(goal as i64, io.goal_ty);
+                    if bus.write(id, io.goal_addr, &bytes).is_err() {
+                        errors += 1;
+                    }
+                    if bus.read(id, io.pos_addr, io.pos_ty.len()).is_err() {
+                        errors += 1;
+                    }
+                }
+            }
+            BenchKind::RwHoldSync | BenchKind::RwSineSync => {
+                let moving = run.kind.moving();
+                let goals: Vec<Vec<u8>> = (0..run.ids.len())
+                    .map(|i| encode_value(run.goal(i, t, moving) as i64, io.goal_ty))
+                    .collect();
+                if bus.sync_write(&run.ids, io.goal_addr, &goals).is_err() {
+                    errors += 1;
+                }
+                match bus.sync_read(&run.ids, io.pos_addr, io.pos_ty.len()) {
+                    Ok(v) if v.len() == run.ids.len() && v.iter().all(|b| !b.is_empty()) => {}
+                    _ => errors += 1,
+                }
+            }
+        }
+
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        run.done += 1;
+        run.stats.errors += errors;
+        if errors == 0 {
+            run.stats.ok += 1;
+            run.stats.samples_ms.push(elapsed_ms);
+        }
+    }
+
+    fn finish_bench(&mut self) {
+        let Some(run) = self.bench_run.take() else {
+            return;
+        };
+        // Restore motors to their captured resting positions after a write sweep.
+        if run.kind.writes() && run.io.has_goal {
+            if let Some(bus) = self.bus.as_mut() {
+                for (&id, &home) in run.ids.iter().zip(run.home.iter()) {
+                    let bytes = encode_value(home as i64, run.io.goal_ty);
+                    let _ = bus.write(id, run.io.goal_addr, &bytes);
+                }
+            }
+        }
+
+        // Sine runs enabled torque at the start — turn it back off so the bus
+        // is left in the state the user found it in.
+        if run.kind.moving() {
+            let ids = run.ids.clone();
+            self.set_torque(&ids, run.io, false);
+        }
+
+        let secs = run.elapsed_secs();
+        let result = BenchResult {
+            kind: run.kind,
+            stats: run.stats,
+            motors: run.ids.len(),
+            iters: run.done,
+            secs,
+        };
+        let errs = result.stats.errors;
+        let title = run.kind.title();
+        self.bench_results.insert(bench_key(run.kind), result);
+        self.status = if errs == 0 {
+            format!("Done: {} — {} cycles in {:.1}s, no errors.", title, run.done, secs)
+        } else {
+            format!(
+                "Done: {} — {} cycles in {:.1}s, {} error(s).",
+                title, run.done, secs, errs
+            )
+        };
+
+        // Chain into the next queued benchmark, if any.
+        if !self.bench_queue.is_empty() {
+            let next = self.bench_queue.remove(0);
+            self.start_bench(next);
         }
     }
 }

@@ -61,6 +61,45 @@ then `Enter` to scan. Use the keyboard or the mouse: click motors and
 registers, drag the goal-position slider, click the torque pill to toggle.
 Esc returns to the connection screen, `q` quits.
 
+## Benchmark mode
+
+From the main screen press `p` to open the **communication benchmark**. It
+reuses the open bus and discovered motors to measure round-trip timing of the
+operations a real control loop relies on:
+
+| Benchmark | What it measures |
+|-----------|------------------|
+| Ping one motor | Latency of a single ping to the selected motor |
+| Ping all motors (sweep) | Latency to ping every motor on the bus once |
+| Read one position | Latency of one Present Position read |
+| Read all positions (sequential) | Reading every motor with individual reads |
+| Read all positions (sync) | One `sync_read` for all motors — compare vs. sequential |
+| R/W loop, hold (sequential) | Per motor: write the resting position (no motion), then read — try this first |
+| R/W loop, hold (sync) | One `sync_write` of resting positions (no motion) + one `sync_read` |
+| R/W loop, sine (sequential) | Per motor: write a small sine goal, then read position |
+| R/W loop, sine (sync) | One `sync_write` of sine goals + one `sync_read` — the fast control loop |
+
+Each benchmark runs for a fixed **duration** (default 10 s, adjustable in the
+UI) and reports the number of cycles completed, min / mean / p50 / p95 / max /
+std latency, the achievable rate in Hz, and a count of failed transactions
+(read/write/ping errors), so a flaky cable or adapter shows up immediately. For
+multi-motor benchmarks a "per motor" figure is also shown.
+
+Controls: `↑↓` select a benchmark, `Enter` run it, `a` run all back-to-back,
+`[` / `]` change the run duration, `-` / `+` change the sine amplitude, `Esc`
+returns to the configurator.
+
+All four R/W loop benchmarks capture each motor's resting position first and
+restore it when finished. The **hold** variants write that resting position
+back unchanged — they exercise the complete write+read loop **without commanding
+any motion**, so they are the safe ones to try first. The **sine** variants add a
+small offset that follows `home + A·sin(2π·f·t + φ)`: amplitude `A` defaults to
+±5° (adjustable in the UI with `-`/`+` and shown in the detail pane), frequency
+`f` is 0.5 Hz, and each motor gets a phase `φ = 2π·i/n` so the bus moves as a
+travelling wave. The sine runs **enable torque automatically** before the sweep
+and **disable it again when finished** (or when stopped), so the motors actually
+move and the bus is left as you found it.
+
 ## License
 
 Apache-2.0
