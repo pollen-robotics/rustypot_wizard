@@ -53,7 +53,14 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
         } else {
             150
         };
-        if event::poll(Duration::from_millis(poll_ms))? {
+        // Drain *all* buffered events this iteration. Consuming only one event
+        // per frame lets a stop key ('s'/'S'/Esc) sit behind other queued input
+        // (mouse events, focus in/out, earlier keystrokes), so during a scan —
+        // where each frame can block up to ~200ms in serial pings — the scan
+        // could finish before the stop key was ever read.
+        let mut first = true;
+        while event::poll(Duration::from_millis(if first { poll_ms } else { 0 }))? {
+            first = false;
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     handle_key(&mut app, key.code, key.modifiers);
@@ -84,9 +91,15 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
         }
         if app.scan.is_some() {
             // Pump several pings per frame to keep the scan brisk while
-            // still updating the UI as motors are discovered.
+            // still updating the UI as motors are discovered. Each ping can
+            // block up to the serial timeout, so bail out of the pump as soon
+            // as input arrives — the stop key is handled on the next iteration,
+            // keeping interruption latency to a single ping instead of four.
             for _ in 0..4 {
                 if !app.tick_scan() {
+                    break;
+                }
+                if event::poll(Duration::from_millis(0))? {
                     break;
                 }
             }
