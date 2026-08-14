@@ -6,7 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, ConfirmAction, FocusedPane, Hit, HitZone, Mode, SetupField};
+use crate::app::{bench_key, App, ConfirmAction, FocusedPane, Hit, HitZone, Mode, SetupField};
+use crate::bench::{BenchKind, BenchResult};
 use crate::registers::{decode_value, Access, Brand, Protocol, Reg, RegType, COMMON_BAUDRATES};
 
 const ACCENT: Color = Color::Cyan;
@@ -36,6 +37,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Setup => draw_setup(f, chunks[1], app),
         Mode::Main => draw_main(f, chunks[1], app),
+        Mode::Bench => draw_bench(f, chunks[1], app),
     }
     draw_status(f, chunks[2], app);
 
@@ -72,8 +74,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 if app.scan.is_some() {
                     " Scanning…  s/Esc stop  q quit "
                 } else {
-                    " Tab focus  ↑↓ select  s rescan  r reread  e edit  Esc setup  q quit "
+                    " Tab focus  ↑↓ select  s rescan  e edit  p benchmark  Esc setup  q quit "
                 }
+            }
+        }
+        Mode::Bench => {
+            if app.bench_run.is_some() {
+                " Running…  Esc/s stop  q quit "
+            } else {
+                " ↑↓ test  Enter run  a run all  [ ] duration  -/+ amplitude  Esc back  q quit "
             }
         }
     };
@@ -861,4 +870,314 @@ fn access_label(a: Access) -> &'static str {
 #[allow(dead_code)]
 fn _silence(_: &[u32]) {
     let _ = COMMON_BAUDRATES;
+}
+
+// ---------------- Benchmark ----------------
+
+fn draw_bench(f: &mut Frame, area: Rect, app: &App) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(area);
+
+    draw_bench_list(f, cols[0], app);
+    draw_bench_detail(f, cols[1], app);
+}
+
+fn fmt_ms(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.3} ms", x),
+        None => "—".into(),
+    }
+}
+
+fn fmt_hz(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.1} Hz", x),
+        None => "—".into(),
+    }
+}
+
+fn draw_bench_list(f: &mut Frame, area: Rect, app: &App) {
+    let block = bordered_block(" Benchmarks ", true);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Reserve a few lines at the bottom for settings.
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(5)])
+        .split(inner);
+    let list_area = v[0];
+
+    let running_kind = app.bench_run.as_ref().map(|r| r.kind);
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, &kind) in BenchKind::ALL.iter().enumerate() {
+        let result = app.bench_results.get(&bench_key(kind));
+        let (marker, marker_style) = if running_kind == Some(kind) {
+            ("▶", Style::default().fg(Color::Yellow))
+        } else if let Some(r) = result {
+            if r.stats.errors > 0 {
+                ("✓", Style::default().fg(Color::Rgb(220, 160, 60)))
+            } else {
+                ("✓", Style::default().fg(Color::Green))
+            }
+        } else {
+            ("·", Style::default().fg(Color::DarkGray))
+        };
+        let summary = match result {
+            Some(r) => {
+                let hz = fmt_hz(r.stats.hz());
+                let mean = fmt_ms(r.stats.mean());
+                if r.stats.errors > 0 {
+                    format!("{}  ·  {}  ·  {} err", mean, hz, r.stats.errors)
+                } else {
+                    format!("{}  ·  {}", mean, hz)
+                }
+            }
+            None => "not run".into(),
+        };
+        let selected = i == app.bench_idx;
+        let title_style = if selected {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(format!(" {} ", marker), marker_style),
+                Span::styled(kind.title(), title_style),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled(summary, Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+        items.push(ListItem::new(lines));
+
+        // Hit zone covering both rows of this entry.
+        let y = list_area.y + (i as u16) * 2;
+        if y < list_area.y + list_area.height {
+            add_zone(
+                app,
+                Rect {
+                    x: list_area.x,
+                    y,
+                    width: list_area.width,
+                    height: 2,
+                },
+                Hit::BenchIdx(i),
+            );
+        }
+    }
+
+    let mut state = ListState::default();
+    state.select(Some(app.bench_idx));
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(ROW_HL))
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Never);
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    draw_bench_settings(f, v[1], app);
+}
+
+fn draw_bench_settings(f: &mut Frame, area: Rect, app: &App) {
+    let motors = app.motors.len();
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("run for ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.0}s", app.bench_secs),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  [ ]", Style::default().fg(Color::DarkGray)),
+            Span::raw("   "),
+            Span::styled("sine ±", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.0}°", app.bench_amp_deg),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" @ ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.1}Hz", app.bench_freq_hz),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("  -/+", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("bus    ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{} motor(s)", motors),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  [ Run ]  ", run_btn_style()),
+            Span::raw(" "),
+            Span::styled("  [ Run all ]  ", run_btn_style()),
+        ]),
+    ];
+    let p = Paragraph::new(lines);
+    f.render_widget(p, area);
+
+    // Approximate button hit zones on the 3rd line.
+    if area.height >= 3 {
+        let y = area.y + 2;
+        add_zone(
+            app,
+            Rect { x: area.x, y, width: 9, height: 1 },
+            Hit::RunBench,
+        );
+        add_zone(
+            app,
+            Rect { x: area.x + 10, y, width: 13, height: 1 },
+            Hit::RunAllBench,
+        );
+    }
+}
+
+fn run_btn_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .bg(HEADER_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn draw_bench_detail(f: &mut Frame, area: Rect, app: &App) {
+    let kind = app.selected_bench();
+    let title = format!(" {} ", kind.title());
+    let block = bordered_block(&title, false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    // Description.
+    let desc = Paragraph::new(kind.desc())
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: true });
+    f.render_widget(desc, v[0]);
+
+    // Trajectory parameters — amplitude only matters for the sine variants.
+    let param_line = if kind.writes() {
+        if kind.moving() {
+            Line::from(vec![
+                Span::styled("trajectory  ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("sine ±{:.0}°", app.bench_amp_deg),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" @ {:.1} Hz · torque auto on/off", app.bench_freq_hz),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled("   (-/+ amp)", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("trajectory  ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "hold resting position — no motion",
+                    Style::default().fg(Color::Green),
+                ),
+            ])
+        }
+    } else {
+        Line::from("")
+    };
+    f.render_widget(Paragraph::new(param_line), v[1]);
+
+    // Progress gauge (only while this benchmark runs).
+    if let Some(run) = app.bench_run.as_ref() {
+        if run.kind == kind {
+            let label = format!(
+                "{:.1}/{:.0}s  ·  {} cycles  ·  {} err",
+                run.elapsed_secs(),
+                run.duration_secs,
+                run.done,
+                run.stats.errors
+            );
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(ACCENT).bg(Color::Rgb(20, 20, 28)))
+                .ratio(run.ratio())
+                .label(Span::styled(
+                    label,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
+            f.render_widget(gauge, v[2]);
+        }
+    }
+
+    // Results.
+    match app.bench_results.get(&bench_key(kind)) {
+        Some(result) => draw_bench_stats(f, v[3], result),
+        None => {
+            let hint = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Enter to run this benchmark.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]);
+            f.render_widget(hint, v[3]);
+        }
+    }
+}
+
+fn draw_bench_stats(f: &mut Frame, area: Rect, result: &BenchResult) {
+    let s = &result.stats;
+    let per_motor = match (s.mean(), result.motors) {
+        (Some(m), n) if n > 1 => Some(m / n as f64),
+        _ => None,
+    };
+
+    fn row(label: &str, value: String) -> Row<'static> {
+        Row::new(vec![
+            Cell::from(label.to_string()).style(Style::default().fg(Color::Gray)),
+            Cell::from(value).style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .height(1)
+    }
+
+    let err_style = if s.errors > 0 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    };
+
+    let mut rows = vec![
+        row("duration", format!("{:.1} s", result.secs)),
+        row("cycles", format!("{}", result.iters)),
+        Row::new(vec![
+            Cell::from("errors").style(Style::default().fg(Color::Gray)),
+            Cell::from(format!("{}", s.errors)).style(err_style),
+        ])
+        .height(1),
+        row("motors / cycle", format!("{}", result.motors)),
+        row("rate", fmt_hz(s.hz())),
+        row("mean", fmt_ms(s.mean())),
+        row("min", fmt_ms(s.min())),
+        row("p50", fmt_ms(s.percentile(0.50))),
+        row("p95", fmt_ms(s.percentile(0.95))),
+        row("max", fmt_ms(s.max())),
+        row("std", fmt_ms(s.std())),
+    ];
+    if let Some(pm) = per_motor {
+        rows.push(row("per motor", fmt_ms(Some(pm))));
+    }
+
+    let table = Table::new(rows, [Constraint::Length(16), Constraint::Min(10)]);
+    f.render_widget(table, area);
 }

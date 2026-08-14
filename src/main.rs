@@ -1,4 +1,5 @@
 mod app;
+mod bench;
 mod comm;
 mod config;
 mod registers;
@@ -46,7 +47,8 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
         terminal.draw(|f| ui::draw(f, &app))?;
 
         let scanning = app.scan.is_some();
-        let poll_ms = if scanning {
+        let benching = app.bench_run.is_some();
+        let poll_ms = if scanning || benching {
             0
         } else if app.mode == Mode::Main && app.editing.is_none() {
             50
@@ -76,6 +78,7 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                             FocusedPane::Motors => app.move_motor(-1),
                             FocusedPane::Registers => app.move_reg(-1),
                         },
+                        Mode::Bench => app.move_bench(-1),
                     },
                     MouseEventKind::ScrollDown => match app.mode {
                         Mode::Setup => app.cycle_field(true),
@@ -83,6 +86,7 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                             FocusedPane::Motors => app.move_motor(1),
                             FocusedPane::Registers => app.move_reg(1),
                         },
+                        Mode::Bench => app.move_bench(1),
                     },
                     _ => {}
                 },
@@ -100,6 +104,17 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()> {
                     break;
                 }
                 if event::poll(Duration::from_millis(0))? {
+                    break;
+                }
+            }
+        } else if app.bench_run.is_some() {
+            // Pump cycles for a short time budget so the UI stays ~30 fps
+            // while the benchmark runs as fast as the bus allows.
+            let budget = std::time::Instant::now();
+            while app.bench_run.is_some()
+                && budget.elapsed() < Duration::from_millis(20)
+            {
+                if !app.tick_bench() {
                     break;
                 }
             }
@@ -123,6 +138,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     match app.mode {
         Mode::Setup => handle_setup_key(app, code, mods),
         Mode::Main => handle_main_key(app, code, mods),
+        Mode::Bench => handle_bench_key(app, code, mods),
     }
 }
 
@@ -201,6 +217,31 @@ fn handle_main_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('g') => app.start_edit_goal(),
         KeyCode::Char('b') | KeyCode::Char('B') => app.reboot_selected(),
         KeyCode::Char('F') => app.request_factory_reset(),
+        KeyCode::Char('p') | KeyCode::Char('P') => app.open_bench(),
+        _ => {}
+    }
+}
+
+fn handle_bench_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    match code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
+        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => app.should_quit = true,
+        KeyCode::Esc => {
+            if app.bench_run.is_some() {
+                app.stop_bench();
+            } else {
+                app.mode = Mode::Main;
+                app.status = "Back to configurator.".into();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.move_bench(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_bench(1),
+        KeyCode::Enter | KeyCode::Char(' ') => app.start_selected_bench(),
+        KeyCode::Char('a') | KeyCode::Char('A') => app.run_all_bench(),
+        KeyCode::Char('[') => app.adjust_secs(false),
+        KeyCode::Char(']') => app.adjust_secs(true),
+        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_amp(-1.0),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_amp(1.0),
         _ => {}
     }
 }
