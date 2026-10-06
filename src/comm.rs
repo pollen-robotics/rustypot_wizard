@@ -71,6 +71,14 @@ impl Bus {
             .map_err(|e| anyhow!("sync_read failed: {}", e))
     }
 
+    /// Same as `sync_read`, but every motor answers in a single status packet
+    /// (Fast Sync Read, protocol v2 only).
+    pub fn fast_sync_read(&mut self, ids: &[u8], addr: u8, length: u8) -> Result<Vec<Vec<u8>>> {
+        self.dph
+            .fast_sync_read(self.port.as_mut(), ids, addr, length)
+            .map_err(|e| anyhow!("fast_sync_read failed: {}", e))
+    }
+
     /// Write per-id values to the same register in one bus transaction (no status response).
     pub fn sync_write(&mut self, ids: &[u8], addr: u8, data: &[Vec<u8>]) -> Result<()> {
         self.dph

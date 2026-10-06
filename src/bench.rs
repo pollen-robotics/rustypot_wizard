@@ -23,14 +23,20 @@ pub enum BenchKind {
     ReadAllSeq,
     /// Read present position of every motor in a single sync_read.
     ReadAllSync,
+    /// Read present position of every motor in a single fast sync_read (v2 only).
+    ReadAllFastSync,
     /// Per motor: write the resting position (no motion) then read it back.
     RwHoldSeq,
     /// One sync_write of resting positions (no motion) + one sync_read.
     RwHoldSync,
+    /// One sync_write of resting positions (no motion) + one fast sync_read (v2 only).
+    RwHoldFastSync,
     /// Per motor: write a sine goal then read present position (sequential round trips).
     RwSineSeq,
     /// One sync_write of sine goals + one sync_read of positions (fast control loop).
     RwSineSync,
+    /// One sync_write of sine goals + one fast sync_read of positions (v2 only).
+    RwSineFastSync,
 }
 
 impl BenchKind {
@@ -40,10 +46,13 @@ impl BenchKind {
         BenchKind::ReadOnePos,
         BenchKind::ReadAllSeq,
         BenchKind::ReadAllSync,
+        BenchKind::ReadAllFastSync,
         BenchKind::RwHoldSeq,
         BenchKind::RwHoldSync,
+        BenchKind::RwHoldFastSync,
         BenchKind::RwSineSeq,
         BenchKind::RwSineSync,
+        BenchKind::RwSineFastSync,
     ];
 
     pub fn title(self) -> &'static str {
@@ -53,10 +62,13 @@ impl BenchKind {
             BenchKind::ReadOnePos => "Read one position",
             BenchKind::ReadAllSeq => "Read all positions (sequential)",
             BenchKind::ReadAllSync => "Read all positions (sync)",
+            BenchKind::ReadAllFastSync => "Read all positions (fast sync)",
             BenchKind::RwHoldSeq => "R/W loop, hold (sequential)",
             BenchKind::RwHoldSync => "R/W loop, hold (sync)",
+            BenchKind::RwHoldFastSync => "R/W loop, hold (fast sync)",
             BenchKind::RwSineSeq => "R/W loop, sine (sequential)",
             BenchKind::RwSineSync => "R/W loop, sine (sync)",
+            BenchKind::RwSineFastSync => "R/W loop, sine (fast sync)",
         }
     }
 
@@ -71,17 +83,26 @@ impl BenchKind {
             BenchKind::ReadAllSync => {
                 "Read Present Position from all motors in one sync_read packet — compare against sequential."
             }
+            BenchKind::ReadAllFastSync => {
+                "Read Present Position from all motors with one fast sync_read: every motor answers in a single status packet. Protocol v2 only; needs recent firmware (XL330: v46+)."
+            }
             BenchKind::RwHoldSeq => {
                 "Per motor: write the resting Goal Position (no motion) then read Present Position. Safe full R/W loop — try this first."
             }
             BenchKind::RwHoldSync => {
                 "One sync_write of resting positions (no motion) + one sync_read. Safe fast control loop — try this first."
             }
+            BenchKind::RwHoldFastSync => {
+                "One sync_write of resting positions (no motion) + one fast sync_read. Protocol v2 only; needs recent firmware (XL330: v46+)."
+            }
             BenchKind::RwSineSeq => {
                 "Per motor: write a small sine Goal Position then read Present Position. Torque is enabled for the run and disabled afterwards."
             }
             BenchKind::RwSineSync => {
                 "One sync_write of sine goals + one sync_read of positions. The fast real-time control loop. Torque is enabled for the run and disabled afterwards."
+            }
+            BenchKind::RwSineFastSync => {
+                "One sync_write of sine goals + one fast sync_read of positions. Torque is enabled for the run and disabled afterwards. Protocol v2 only; needs recent firmware (XL330: v46+)."
             }
         }
     }
@@ -97,14 +118,27 @@ impl BenchKind {
             self,
             BenchKind::RwHoldSeq
                 | BenchKind::RwHoldSync
+                | BenchKind::RwHoldFastSync
                 | BenchKind::RwSineSeq
                 | BenchKind::RwSineSync
+                | BenchKind::RwSineFastSync
         )
     }
 
     /// Does this benchmark drive a sine trajectory (vs. holding the resting position)?
     pub fn moving(self) -> bool {
-        matches!(self, BenchKind::RwSineSeq | BenchKind::RwSineSync)
+        matches!(
+            self,
+            BenchKind::RwSineSeq | BenchKind::RwSineSync | BenchKind::RwSineFastSync
+        )
+    }
+
+    /// Does this benchmark use the Fast Sync Read instruction (protocol v2 only)?
+    pub fn fast_sync(self) -> bool {
+        matches!(
+            self,
+            BenchKind::ReadAllFastSync | BenchKind::RwHoldFastSync | BenchKind::RwSineFastSync
+        )
     }
 }
 
