@@ -42,6 +42,8 @@ pub enum FocusedPane {
 
 pub struct DiscoveredMotor {
     pub id: u8,
+    /// Baud rate the motor answered at.
+    pub baud: u32,
     pub model_number: Option<u16>,
     pub model: Option<&'static Model>,
 }
@@ -66,6 +68,7 @@ pub struct App {
     pub brand: Brand,
     pub ports: Vec<String>,
     pub port_idx: usize,
+    /// Index into COMMON_BAUDRATES; `COMMON_BAUDRATES.len()` means "all".
     pub baud_idx: usize,
     pub protocol: Protocol,
     pub scan_max: u8,
@@ -120,15 +123,26 @@ pub enum Hit {
 pub struct ScanProgress {
     pub next_id: u16,
     pub max: u8,
+    /// Baud rates to scan, in order; `baud_pos` is the one in progress.
+    pub bauds: Vec<u32>,
+    pub baud_pos: usize,
 }
 
 impl ScanProgress {
+    pub fn total(&self) -> usize {
+        (self.max as usize + 1) * self.bauds.len()
+    }
+    pub fn pinged(&self) -> usize {
+        self.baud_pos * (self.max as usize + 1) + (self.next_id as usize).min(self.max as usize + 1)
+    }
     pub fn ratio(&self) -> f64 {
-        let total = self.max as f64 + 1.0;
-        (self.next_id as f64 / total).clamp(0.0, 1.0)
+        (self.pinged() as f64 / self.total().max(1) as f64).clamp(0.0, 1.0)
+    }
+    pub fn current_baud(&self) -> Option<u32> {
+        self.bauds.get(self.baud_pos).copied()
     }
     pub fn done(&self) -> bool {
-        self.next_id > self.max as u16
+        self.baud_pos >= self.bauds.len()
     }
 }
 
@@ -176,8 +190,19 @@ impl App {
         self.ports.get(self.port_idx).map(|s| s.as_str())
     }
 
-    pub fn current_baud(&self) -> u32 {
-        COMMON_BAUDRATES[self.baud_idx]
+    /// Baud rates selected in the setup screen.
+    pub fn scan_bauds(&self) -> Vec<u32> {
+        match COMMON_BAUDRATES.get(self.baud_idx) {
+            Some(&b) => vec![b],
+            None => COMMON_BAUDRATES.to_vec(),
+        }
+    }
+
+    pub fn baud_label(&self) -> String {
+        match COMMON_BAUDRATES.get(self.baud_idx) {
+            Some(b) => format!("{} bps", b),
+            None => format!("All ({} rates)", COMMON_BAUDRATES.len()),
+        }
     }
 
     pub fn refresh_ports(&mut self) {
@@ -216,7 +241,7 @@ impl App {
                 }
             }
             SetupField::Baud => {
-                let n = COMMON_BAUDRATES.len() as i32;
+                let n = COMMON_BAUDRATES.len() as i32 + 1; // + "all"
                 let i = (self.baud_idx as i32 + delta).rem_euclid(n);
                 self.baud_idx = i as usize;
             }
@@ -241,13 +266,13 @@ impl App {
                 return;
             }
         };
-        let baud = self.current_baud();
+        let baud = self.scan_bauds()[0];
         let protocol = self.protocol;
         match Bus::open(&port, baud, protocol) {
             Ok(bus) => {
                 self.bus = Some(bus);
                 save_last_port(&port);
-                self.status = format!("Opened {} @ {} bps. Scanning…", port, baud);
+                self.status = format!("Opened {}. Scanning…", port);
                 self.start_scan();
                 self.mode = Mode::Main;
             }
@@ -262,11 +287,21 @@ impl App {
         self.motor_idx = 0;
         self.reg_idx = 0;
         self.reg_values.clear();
+        let bauds = self.scan_bauds();
+        if let Some(bus) = self.bus.as_mut() {
+            let _ = bus.set_baud(bauds[0]);
+        }
+        self.status = format!(
+            "Scanning IDs 0..={} at {}…",
+            self.scan_max,
+            self.baud_label()
+        );
         self.scan = Some(ScanProgress {
             next_id: 0,
             max: self.scan_max,
+            bauds,
+            baud_pos: 0,
         });
-        self.status = format!("Scanning IDs 0..={}…", self.scan_max);
     }
 
     /// Ping one id and advance the scan. Returns true if scan is still running.
@@ -278,7 +313,19 @@ impl App {
             self.finish_scan();
             return false;
         }
+        if scan.next_id > scan.max as u16 {
+            // Done with this baud rate: move on to the next one.
+            scan.next_id = 0;
+            scan.baud_pos += 1;
+            if let (Some(baud), Some(bus)) = (scan.current_baud(), self.bus.as_mut()) {
+                if let Err(e) = bus.set_baud(baud) {
+                    self.status = e.to_string();
+                }
+            }
+            return true;
+        }
         let id = scan.next_id as u8;
+        let baud = scan.current_baud().unwrap_or(0);
         scan.next_id += 1;
         if let Some(bus) = self.bus.as_mut() {
             if bus.ping(id) {
@@ -291,6 +338,7 @@ impl App {
                 let was_empty = self.motors.is_empty();
                 self.motors.push(DiscoveredMotor {
                     id,
+                    baud,
                     model_number,
                     model,
                 });
@@ -317,9 +365,42 @@ impl App {
     fn finish_scan(&mut self) {
         self.scan = None;
         self.status = format!("Found {} motor(s).", self.motors.len());
-        if !self.motors.is_empty() && self.reg_values.is_empty() {
+        // Motors are found baud by baud then id by id, so this is already the
+        // tree order; sort anyway to keep the invariant explicit.
+        let selected = self.selected_motor().map(|m| (m.baud, m.id));
+        self.sort_motors(selected);
+        // The scan may have left the port on another baud rate.
+        if self.sync_baud() || self.reg_values.is_empty() {
             self.read_all_regs_for_selected();
         }
+    }
+
+    /// Sort motors in tree order (baud, then id) and keep `selected` selected.
+    fn sort_motors(&mut self, selected: Option<(u32, u8)>) {
+        self.motors.sort_by_key(|m| (m.baud, m.id));
+        if let Some(key) = selected {
+            if let Some(i) = self.motors.iter().position(|m| (m.baud, m.id) == key) {
+                self.motor_idx = i;
+            }
+        }
+    }
+
+    /// Put the port at the selected motor's baud rate. Returns true if it
+    /// had to change.
+    fn sync_baud(&mut self) -> bool {
+        let Some(baud) = self.selected_motor().map(|m| m.baud) else {
+            return false;
+        };
+        let Some(bus) = self.bus.as_mut() else {
+            return false;
+        };
+        if bus.baud == baud {
+            return false;
+        }
+        if let Err(e) = bus.set_baud(baud) {
+            self.status = e.to_string();
+        }
+        true
     }
 
     pub fn selected_motor(&self) -> Option<&DiscoveredMotor> {
@@ -335,6 +416,9 @@ impl App {
 
     pub fn read_all_regs_for_selected(&mut self) {
         self.reg_values.clear();
+        if self.scan.is_none() {
+            self.sync_baud();
+        }
         let Some(motor) = self.selected_motor() else {
             return;
         };
@@ -490,8 +574,12 @@ impl App {
             self.status = format!("Motor already has ID {}.", id);
             return;
         }
-        if self.motors.iter().any(|m| m.id == new_id) {
-            self.status = format!("ID {} is already used by another motor.", new_id);
+        let baud = self.selected_motor().map(|m| m.baud).unwrap_or(0);
+        if self.motors.iter().any(|m| m.id == new_id && m.baud == baud) {
+            self.status = format!(
+                "ID {} is already used by another motor at {} bps.",
+                new_id, baud
+            );
             return;
         }
         let lock = self.feetech_unlock(id);
@@ -504,8 +592,7 @@ impl App {
             if let Some(m) = self.motors.get_mut(self.motor_idx) {
                 m.id = new_id;
             }
-            self.motors.sort_by_key(|m| m.id);
-            self.motor_idx = self.motors.iter().position(|m| m.id == new_id).unwrap_or(0);
+            self.sort_motors(Some((baud, new_id)));
             self.read_all_regs_for_selected();
             self.status = format!("ID changed {} → {}.", id, new_id);
         } else {
@@ -518,55 +605,50 @@ impl App {
         }
     }
 
-    /// Write a new baud rate, then reopen the port at that rate and check the
-    /// motor still answers. Other motors stay at the old rate.
+    /// Write a new baud rate, then switch the port to that rate and check the
+    /// motor answers there. The motor moves to that baud group in the tree;
+    /// the port follows whichever motor is selected, so the others keep
+    /// working at their own rate.
     fn change_baud(&mut self, id: u8, reg: Reg, value: i64) {
         let Some(new_baud) = baud_from_reg_value(self.current_regs(), value) else {
             self.status = format!("Unknown baud rate value {} for this model.", value);
             return;
         };
-        let Some(bus) = self.bus.as_ref() else { return };
-        let (port, old_baud, protocol) = (bus.port_name.clone(), bus.baud, bus.protocol);
+        let Some(old_baud) = self.bus.as_ref().map(|b| b.baud) else {
+            return;
+        };
+        if new_baud == old_baud {
+            self.status = format!("Motor {} is already at {} bps.", id, new_baud);
+            return;
+        }
+        if self.motors.iter().any(|m| m.id == id && m.baud == new_baud) {
+            self.status = format!(
+                "ID {} is already used by another motor at {} bps.",
+                id, new_baud
+            );
+            return;
+        }
         let lock = self.feetech_unlock(id);
         let Some(bus) = self.bus.as_mut() else { return };
         let write_res = bus.write(id, reg.addr as u8, &encode_value(value, reg.ty));
         std::thread::sleep(std::time::Duration::from_millis(50));
-
-        if new_baud != old_baud {
-            // Close the old handle before reopening the same device.
-            self.bus = None;
-            match Bus::open(&port, new_baud, protocol) {
-                Ok(b) => self.bus = Some(b),
-                Err(e) => {
-                    self.status = format!("Reopen at {} bps failed: {}", new_baud, e);
-                    self.bus = Bus::open(&port, old_baud, protocol).ok();
-                    return;
-                }
-            }
+        if let Err(e) = bus.set_baud(new_baud) {
+            let _ = bus.set_baud(old_baud);
+            self.feetech_relock(id, lock);
+            self.status = e.to_string();
+            return;
         }
-        let bus = self.bus.as_mut().unwrap();
-        bus.flush_input();
         if bus.ping(id) {
             self.feetech_relock(id, lock);
-            if let Some(i) = COMMON_BAUDRATES.iter().position(|&b| b == new_baud) {
-                self.baud_idx = i;
+            if let Some(m) = self.motors.get_mut(self.motor_idx) {
+                m.baud = new_baud;
             }
+            self.sort_motors(Some((new_baud, id)));
             self.read_all_regs_for_selected();
-            let others = self.motors.len().saturating_sub(1);
-            self.status = if new_baud == old_baud || others == 0 {
-                format!("Baud rate of id {} set to {} bps.", id, new_baud)
-            } else {
-                format!(
-                    "Baud rate of id {} set to {} bps — now talking at {} bps; {} other motor(s) still at {} bps.",
-                    id, new_baud, new_baud, others, old_baud
-                )
-            };
+            self.status = format!("Motor {} moved {} → {} bps.", id, old_baud, new_baud);
         } else {
             // The motor did not move to the new rate: go back to the old one.
-            if new_baud != old_baud {
-                self.bus = None;
-                self.bus = Bus::open(&port, old_baud, protocol).ok();
-            }
+            let _ = bus.set_baud(old_baud);
             self.feetech_relock(id, lock);
             self.status = match write_res {
                 Err(e) => format!("Baud write failed: {}", e),

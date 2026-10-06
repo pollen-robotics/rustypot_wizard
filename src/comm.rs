@@ -10,7 +10,6 @@ pub struct Bus {
     pub port: Box<dyn serialport::SerialPort>,
     pub port_name: String,
     pub baud: u32,
-    pub protocol: Protocol,
 }
 
 impl Bus {
@@ -28,8 +27,19 @@ impl Bus {
             port,
             port_name: port_name.to_string(),
             baud,
-            protocol,
         })
+    }
+
+    /// Switch the open port to another baud rate (no-op if already there).
+    pub fn set_baud(&mut self, baud: u32) -> Result<()> {
+        if baud != self.baud {
+            self.port
+                .set_baud_rate(baud)
+                .map_err(|e| anyhow!("could not set {} bps: {}", baud, e))?;
+            self.baud = baud;
+        }
+        self.flush_input();
+        Ok(())
     }
 
     /// Drop any bytes left in the input buffer (e.g. a status packet sent

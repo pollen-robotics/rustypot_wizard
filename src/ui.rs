@@ -131,7 +131,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let fields: [(&str, String); 5] = [
         ("Brand", brand_label(app.brand).to_string()),
         ("Port", port_label(app)),
-        ("Baudrate", format!("{} bps", app.current_baud())),
+        ("Baudrate", app.baud_label()),
         ("Protocol", protocol_label(app.protocol).to_string()),
         ("Scan IDs", format!("0..={}", app.scan_max)),
     ];
@@ -191,7 +191,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let field_help = match app.current_field() {
         SetupField::Brand => "Pick the protocol family — Dynamixel or Feetech.",
         SetupField::Port => "Use ←→ to cycle detected serial ports. F5 to rescan.",
-        SetupField::Baud => "Use ←→ to cycle baud rates.",
+        SetupField::Baud => "Use ←→ to cycle baud rates. \"All\" scans every rate (slower).",
         SetupField::Protocol => "Dynamixel V1 (AX/MX classic, Feetech) or V2 (X-series).",
         SetupField::ScanRange => "Maximum motor ID to ping during scan (0..=N).",
     };
@@ -288,8 +288,8 @@ fn draw_motor_panel(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let port_label = match (&app.bus, app.current_port()) {
-        (Some(bus), _) => format!("{} @ {}", bus.port_name, bus.baud),
-        (None, Some(p)) => format!("{} @ {}", p, app.current_baud()),
+        (Some(bus), _) => bus.port_name.clone(),
+        (None, Some(p)) => p.to_string(),
         (None, None) => "<no port>".into(),
     };
     let mut items: Vec<ListItem> = Vec::new();
@@ -314,24 +314,53 @@ fn draw_motor_panel(f: &mut Frame, area: Rect, app: &App) {
         ),
     ])));
     items.push(ListItem::new(""));
+    // Tree: port ▸ baud rate ▸ motors. Motors are kept sorted by baud, so a
+    // header is emitted each time the baud changes.
+    let mut selected_row = None;
+    let mut motor_rows: Vec<(usize, usize)> = Vec::new(); // (row, motor idx)
     if app.motors.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  (no motors found — press s)",
             Style::default().fg(Color::DarkGray),
         ))));
     } else {
-        for m in &app.motors {
+        let active_baud = app.bus.as_ref().map(|b| b.baud);
+        let mut last_baud = None;
+        for (i, m) in app.motors.iter().enumerate() {
+            if last_baud != Some(m.baud) {
+                last_baud = Some(m.baud);
+                let count = app.motors.iter().filter(|o| o.baud == m.baud).count();
+                let color = if active_baud == Some(m.baud) {
+                    Color::White
+                } else {
+                    Color::Gray
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  ▼ ", Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("{} bps", m.baud),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" ({})", count),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])));
+            }
+            if i == app.motor_idx {
+                selected_row = Some(items.len());
+            }
+            motor_rows.push((items.len(), i));
             items.push(ListItem::new(Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(Color::Green)),
+                Span::styled("    ● ", Style::default().fg(Color::Green)),
                 Span::raw(m.display()),
             ])));
         }
     }
 
-    // Hit zones — motors start at row index 3 (port/brand/spacer above).
-    let motor_row_y0 = inner.y + 3;
-    for (i, _) in app.motors.iter().enumerate() {
-        let y = motor_row_y0 + i as u16;
+    // Hit zones — one per motor row (headers above are not clickable).
+    for (row, i) in motor_rows {
+        let y = inner.y + row as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -348,9 +377,7 @@ fn draw_motor_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let mut state = ListState::default();
-    if !app.motors.is_empty() {
-        state.select(Some(3 + app.motor_idx));
-    }
+    state.select(selected_row);
     let list =
         List::new(items).highlight_style(Style::default().bg(ROW_HL).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, inner, &mut state);
@@ -361,10 +388,18 @@ fn draw_scan_gauge(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     add_zone(app, area, Hit::StartOrStopScan);
+    let baud = match scan.current_baud() {
+        Some(b) if scan.bauds.len() > 1 => {
+            format!(" @ {} ({}/{})", b, scan.baud_pos + 1, scan.bauds.len())
+        }
+        Some(b) => format!(" @ {}", b),
+        None => String::new(),
+    };
     let label = format!(
-        "scan {}/{} · {} found · [S] stop",
-        scan.next_id.min(scan.max as u16 + 1),
-        scan.max as u16 + 1,
+        "scan {}/{}{} · {} found · [S] stop",
+        scan.pinged(),
+        scan.total(),
+        baud,
         app.motors.len()
     );
     let gauge = Gauge::default()
