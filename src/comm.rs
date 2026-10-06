@@ -8,6 +8,9 @@ use crate::registers::Protocol;
 pub struct Bus {
     pub dph: DynamixelProtocolHandler,
     pub port: Box<dyn serialport::SerialPort>,
+    pub port_name: String,
+    pub baud: u32,
+    pub protocol: Protocol,
 }
 
 impl Bus {
@@ -20,7 +23,19 @@ impl Bus {
             Protocol::V1 => DynamixelProtocolHandler::v1(),
             Protocol::V2 => DynamixelProtocolHandler::v2(),
         };
-        Ok(Self { dph, port })
+        Ok(Self {
+            dph,
+            port,
+            port_name: port_name.to_string(),
+            baud,
+            protocol,
+        })
+    }
+
+    /// Drop any bytes left in the input buffer (e.g. a status packet sent
+    /// back at a baud rate or ID we were not expecting).
+    pub fn flush_input(&mut self) {
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
     }
 
     pub fn ping(&mut self, id: u8) -> bool {

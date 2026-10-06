@@ -7,8 +7,8 @@ use ratatui::layout::Rect;
 use crate::comm::{list_ports, Bus};
 use crate::config::{load_last_port, save_last_port};
 use crate::registers::{
-    decode_value, default_regs, encode_value, lookup_model, model_number_addr, Brand, Model,
-    MotorControl, Protocol, Reg, COMMON_BAUDRATES,
+    baud_from_reg_value, decode_value, default_regs, encode_value, lookup_model, model_number_addr,
+    Brand, Model, MotorControl, Protocol, Reg, COMMON_BAUDRATES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,10 +311,7 @@ impl App {
             return;
         }
         self.finish_scan();
-        self.status = format!(
-            "Scan stopped — {} motor(s) found.",
-            self.motors.len()
-        );
+        self.status = format!("Scan stopped — {} motor(s) found.", self.motors.len());
     }
 
     fn finish_scan(&mut self) {
@@ -350,10 +347,8 @@ impl App {
             // Addresses fit in u8 for these protocols/models.
             let addr = reg.addr as u8;
             let res = bus.read(id, addr, reg.ty.len());
-            self.reg_values.insert(
-                reg.addr,
-                res.map_err(|e| e.to_string()),
-            );
+            self.reg_values
+                .insert(reg.addr, res.map_err(|e| e.to_string()));
         }
     }
 
@@ -419,7 +414,12 @@ impl App {
             return;
         };
         let id = motor.id;
-        let reg = match self.current_regs().iter().find(|r| r.addr == edit.addr).copied() {
+        let reg = match self
+            .current_regs()
+            .iter()
+            .find(|r| r.addr == edit.addr)
+            .copied()
+        {
             Some(r) => r,
             None => return,
         };
@@ -430,6 +430,11 @@ impl App {
                 return;
             }
         };
+        match reg.name {
+            "ID" => return self.change_id(id, reg, value),
+            "Baud Rate" => return self.change_baud(id, reg, value),
+            _ => {}
+        }
         let bytes = encode_value(value, reg.ty);
         let Some(bus) = self.bus.as_mut() else { return };
         match bus.write(id, reg.addr as u8, &bytes) {
@@ -440,6 +445,137 @@ impl App {
             Err(e) => {
                 self.status = format!("Write failed: {}", e);
             }
+        }
+    }
+
+    /// Feetech servos only persist EEPROM writes (ID, baud…) while unlocked.
+    /// Returns the Lock register if it was unlocked and must be re-locked.
+    fn feetech_unlock(&mut self, id: u8) -> Option<Reg> {
+        if self.brand != Brand::Feetech {
+            return None;
+        }
+        let lock = self
+            .current_regs()
+            .iter()
+            .find(|r| r.name == "Lock")
+            .copied()?;
+        let bus = self.bus.as_mut()?;
+        bus.write(id, lock.addr as u8, &[0]).ok()?;
+        Some(lock)
+    }
+
+    fn feetech_relock(&mut self, id: u8, lock: Option<Reg>) {
+        if let (Some(lock), Some(bus)) = (lock, self.bus.as_mut()) {
+            let _ = bus.write(id, lock.addr as u8, &[1]);
+        }
+    }
+
+    /// Write a new ID, then follow the motor to it. The status packet may come
+    /// back from the new ID (or not at all), so the write result is not
+    /// trusted: success is decided by pinging the new ID.
+    fn change_id(&mut self, id: u8, reg: Reg, value: i64) {
+        let Ok(new_id) = u8::try_from(value) else {
+            self.status = format!("Invalid ID: {}", value);
+            return;
+        };
+        let max_id = match self.protocol {
+            Protocol::V1 => 253,
+            Protocol::V2 => 252,
+        };
+        if new_id > max_id {
+            self.status = format!("ID must be in 0..={}.", max_id);
+            return;
+        }
+        if new_id == id {
+            self.status = format!("Motor already has ID {}.", id);
+            return;
+        }
+        if self.motors.iter().any(|m| m.id == new_id) {
+            self.status = format!("ID {} is already used by another motor.", new_id);
+            return;
+        }
+        let lock = self.feetech_unlock(id);
+        let Some(bus) = self.bus.as_mut() else { return };
+        let write_res = bus.write(id, reg.addr as u8, &[new_id]);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        bus.flush_input();
+        if bus.ping(new_id) {
+            self.feetech_relock(new_id, lock);
+            if let Some(m) = self.motors.get_mut(self.motor_idx) {
+                m.id = new_id;
+            }
+            self.motors.sort_by_key(|m| m.id);
+            self.motor_idx = self.motors.iter().position(|m| m.id == new_id).unwrap_or(0);
+            self.read_all_regs_for_selected();
+            self.status = format!("ID changed {} → {}.", id, new_id);
+        } else {
+            self.feetech_relock(id, lock);
+            self.status = match write_res {
+                Err(e) => format!("ID write failed: {}", e),
+                Ok(()) => format!("No response from new ID {} after write.", new_id),
+            };
+            self.read_selected_reg();
+        }
+    }
+
+    /// Write a new baud rate, then reopen the port at that rate and check the
+    /// motor still answers. Other motors stay at the old rate.
+    fn change_baud(&mut self, id: u8, reg: Reg, value: i64) {
+        let Some(new_baud) = baud_from_reg_value(self.current_regs(), value) else {
+            self.status = format!("Unknown baud rate value {} for this model.", value);
+            return;
+        };
+        let Some(bus) = self.bus.as_ref() else { return };
+        let (port, old_baud, protocol) = (bus.port_name.clone(), bus.baud, bus.protocol);
+        let lock = self.feetech_unlock(id);
+        let Some(bus) = self.bus.as_mut() else { return };
+        let write_res = bus.write(id, reg.addr as u8, &encode_value(value, reg.ty));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        if new_baud != old_baud {
+            // Close the old handle before reopening the same device.
+            self.bus = None;
+            match Bus::open(&port, new_baud, protocol) {
+                Ok(b) => self.bus = Some(b),
+                Err(e) => {
+                    self.status = format!("Reopen at {} bps failed: {}", new_baud, e);
+                    self.bus = Bus::open(&port, old_baud, protocol).ok();
+                    return;
+                }
+            }
+        }
+        let bus = self.bus.as_mut().unwrap();
+        bus.flush_input();
+        if bus.ping(id) {
+            self.feetech_relock(id, lock);
+            if let Some(i) = COMMON_BAUDRATES.iter().position(|&b| b == new_baud) {
+                self.baud_idx = i;
+            }
+            self.read_all_regs_for_selected();
+            let others = self.motors.len().saturating_sub(1);
+            self.status = if new_baud == old_baud || others == 0 {
+                format!("Baud rate of id {} set to {} bps.", id, new_baud)
+            } else {
+                format!(
+                    "Baud rate of id {} set to {} bps — now talking at {} bps; {} other motor(s) still at {} bps.",
+                    id, new_baud, new_baud, others, old_baud
+                )
+            };
+        } else {
+            // The motor did not move to the new rate: go back to the old one.
+            if new_baud != old_baud {
+                self.bus = None;
+                self.bus = Bus::open(&port, old_baud, protocol).ok();
+            }
+            self.feetech_relock(id, lock);
+            self.status = match write_res {
+                Err(e) => format!("Baud write failed: {}", e),
+                Ok(()) => format!(
+                    "No response at {} bps after write; staying at {} bps.",
+                    new_baud, old_baud
+                ),
+            };
+            self.read_selected_reg();
         }
     }
 
@@ -565,11 +701,7 @@ impl App {
         };
         // Position the register cursor on goal_position so editing logic reuses
         // the existing register-edit path.
-        if let Some(idx) = self
-            .current_regs()
-            .iter()
-            .position(|r| r.addr == reg.addr)
-        {
+        if let Some(idx) = self.current_regs().iter().position(|r| r.addr == reg.addr) {
             self.reg_idx = idx;
         }
         self.start_edit();
@@ -622,7 +754,9 @@ impl App {
     }
 
     pub fn handle_click(&mut self, x: u16, y: u16) {
-        let Some(zone) = self.hit_at(x, y) else { return };
+        let Some(zone) = self.hit_at(x, y) else {
+            return;
+        };
         match zone.hit {
             Hit::SetupField(i) => {
                 if i == self.setup_focus {
