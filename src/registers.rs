@@ -514,8 +514,47 @@ pub fn model_number_addr(brand: Brand) -> u8 {
 }
 
 pub const COMMON_BAUDRATES: &[u32] = &[
-    9600, 57600, 115200, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 4_500_000, 6_000_000,
+    9600, 38400, 57600, 76800, 115200, 128_000, 250_000, 500_000, 1_000_000, 2_000_000, 3_000_000,
+    4_000_000, 4_500_000, 6_000_000,
 ];
+
+/// Translate a "Baud Rate" register value into bits per second, using the
+/// encoding of the given register table. Returns None for unknown values.
+pub fn baud_from_reg_value(regs: &[Reg], value: i64) -> Option<u32> {
+    let is = |table: &[Reg]| std::ptr::eq(regs, table);
+    if is(XL330_REGS) || is(XL430_REGS) || is(MX_V2_REGS) {
+        const T: [u32; 8] = [
+            9600, 57600, 115200, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 4_500_000,
+        ];
+        T.get(usize::try_from(value).ok()?).copied()
+    } else if is(XL320_REGS) {
+        const T: [u32; 4] = [9600, 57600, 115200, 1_000_000];
+        T.get(usize::try_from(value).ok()?).copied()
+    } else if is(AX_REGS) {
+        // Protocol 1.0: bps = 2_000_000 / (value + 1). Snap the documented
+        // values to the standard rates the motor actually tolerates.
+        match value {
+            1 => Some(1_000_000),
+            3 => Some(500_000),
+            4 => Some(400_000),
+            7 => Some(250_000),
+            9 => Some(200_000),
+            16 => Some(115200),
+            34 => Some(57600),
+            103 => Some(19200),
+            207 => Some(9600),
+            0..=254 => Some(2_000_000 / (value as u32 + 1)),
+            _ => None,
+        }
+    } else if is(STS3215_REGS) || is(SCS0009_REGS) {
+        const T: [u32; 8] = [
+            1_000_000, 500_000, 250_000, 128_000, 115200, 76800, 57600, 38400,
+        ];
+        T.get(usize::try_from(value).ok()?).copied()
+    } else {
+        None
+    }
+}
 
 pub fn decode_value(bytes: &[u8], ty: RegType) -> i64 {
     match ty {

@@ -2,7 +2,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table,
+        TableState, Wrap,
+    },
     Frame,
 };
 
@@ -51,7 +54,10 @@ fn draw_title(f: &mut Frame, area: Rect) {
     let title = Line::from(vec![
         Span::styled(
             " Rustypot Wizard ",
-            Style::default().fg(Color::White).bg(HEADER_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
@@ -114,7 +120,10 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             " Connection ",
-            Style::default().fg(Color::White).bg(HEADER_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(panel);
     f.render_widget(block, panel);
@@ -122,7 +131,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let fields: [(&str, String); 5] = [
         ("Brand", brand_label(app.brand).to_string()),
         ("Port", port_label(app)),
-        ("Baudrate", format!("{} bps", app.current_baud())),
+        ("Baudrate", app.baud_label()),
         ("Protocol", protocol_label(app.protocol).to_string()),
         ("Scan IDs", format!("0..={}", app.scan_max)),
     ];
@@ -134,13 +143,20 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
             let selected = i == app.setup_focus;
             let arrow = if selected { "▶" } else { " " };
             let style = if selected {
-                Style::default().fg(Color::White).bg(ROW_HL).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .bg(ROW_HL)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
             Row::new(vec![
                 Cell::from(arrow).style(Style::default().fg(ACCENT)),
-                Cell::from(*label).style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Cell::from(*label).style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Cell::from(value.clone()).style(style),
             ])
             .height(1)
@@ -149,7 +165,11 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
 
     let table = Table::new(
         rows,
-        [Constraint::Length(2), Constraint::Length(14), Constraint::Min(20)],
+        [
+            Constraint::Length(2),
+            Constraint::Length(14),
+            Constraint::Min(20),
+        ],
     );
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -171,7 +191,7 @@ fn draw_setup(f: &mut Frame, area: Rect, app: &App) {
     let field_help = match app.current_field() {
         SetupField::Brand => "Pick the protocol family — Dynamixel or Feetech.",
         SetupField::Port => "Use ←→ to cycle detected serial ports. F5 to rescan.",
-        SetupField::Baud => "Use ←→ to cycle baud rates.",
+        SetupField::Baud => "Use ←→ to cycle baud rates. \"All\" scans every rate (slower).",
         SetupField::Protocol => "Dynamixel V1 (AX/MX classic, Feetech) or V2 (X-series).",
         SetupField::ScanRange => "Maximum motor ID to ping during scan (0..=N).",
     };
@@ -223,7 +243,12 @@ fn port_label(app: &App) -> String {
     if app.ports.is_empty() {
         "<no port detected>".into()
     } else {
-        format!("{} ({}/{})", app.ports[app.port_idx], app.port_idx + 1, app.ports.len())
+        format!(
+            "{} ({}/{})",
+            app.ports[app.port_idx],
+            app.port_idx + 1,
+            app.ports.len()
+        )
     }
 }
 
@@ -262,41 +287,80 @@ fn draw_motor_panel(f: &mut Frame, area: Rect, app: &App) {
         inner
     };
 
-    let port_label = match app.current_port() {
-        Some(p) => format!("{} @ {}", p, app.current_baud()),
-        None => "<no port>".into(),
+    let port_label = match (&app.bus, app.current_port()) {
+        (Some(bus), _) => bus.port_name.clone(),
+        (None, Some(p)) => p.to_string(),
+        (None, None) => "<no port>".into(),
     };
     let mut items: Vec<ListItem> = Vec::new();
     items.push(ListItem::new(Line::from(vec![
         Span::styled("▼ ", Style::default().fg(ACCENT)),
-        Span::styled(port_label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            port_label,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
     ])));
     items.push(ListItem::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            format!("{} / {}", brand_label(app.brand), protocol_label(app.protocol)),
+            format!(
+                "{} / {}",
+                brand_label(app.brand),
+                protocol_label(app.protocol)
+            ),
             Style::default().fg(Color::Gray),
         ),
     ])));
     items.push(ListItem::new(""));
+    // Tree: port ▸ baud rate ▸ motors. Motors are kept sorted by baud, so a
+    // header is emitted each time the baud changes.
+    let mut selected_row = None;
+    let mut motor_rows: Vec<(usize, usize)> = Vec::new(); // (row, motor idx)
     if app.motors.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  (no motors found — press s)",
             Style::default().fg(Color::DarkGray),
         ))));
     } else {
-        for m in &app.motors {
+        let active_baud = app.bus.as_ref().map(|b| b.baud);
+        let mut last_baud = None;
+        for (i, m) in app.motors.iter().enumerate() {
+            if last_baud != Some(m.baud) {
+                last_baud = Some(m.baud);
+                let count = app.motors.iter().filter(|o| o.baud == m.baud).count();
+                let color = if active_baud == Some(m.baud) {
+                    Color::White
+                } else {
+                    Color::Gray
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  ▼ ", Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("{} bps", m.baud),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" ({})", count),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])));
+            }
+            if i == app.motor_idx {
+                selected_row = Some(items.len());
+            }
+            motor_rows.push((items.len(), i));
             items.push(ListItem::new(Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(Color::Green)),
+                Span::styled("    ● ", Style::default().fg(Color::Green)),
                 Span::raw(m.display()),
             ])));
         }
     }
 
-    // Hit zones — motors start at row index 3 (port/brand/spacer above).
-    let motor_row_y0 = inner.y + 3;
-    for (i, _) in app.motors.iter().enumerate() {
-        let y = motor_row_y0 + i as u16;
+    // Hit zones — one per motor row (headers above are not clickable).
+    for (row, i) in motor_rows {
+        let y = inner.y + row as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -313,21 +377,29 @@ fn draw_motor_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let mut state = ListState::default();
-    if !app.motors.is_empty() {
-        state.select(Some(3 + app.motor_idx));
-    }
-    let list = List::new(items)
-        .highlight_style(Style::default().bg(ROW_HL).add_modifier(Modifier::BOLD));
+    state.select(selected_row);
+    let list =
+        List::new(items).highlight_style(Style::default().bg(ROW_HL).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_scan_gauge(f: &mut Frame, area: Rect, app: &App) {
-    let Some(scan) = app.scan.as_ref() else { return };
+    let Some(scan) = app.scan.as_ref() else {
+        return;
+    };
     add_zone(app, area, Hit::StartOrStopScan);
+    let baud = match scan.current_baud() {
+        Some(b) if scan.bauds.len() > 1 => {
+            format!(" @ {} ({}/{})", b, scan.baud_pos + 1, scan.bauds.len())
+        }
+        Some(b) => format!(" @ {}", b),
+        None => String::new(),
+    };
     let label = format!(
-        "scan {}/{} · {} found · [S] stop",
-        scan.next_id.min(scan.max as u16 + 1),
-        scan.max as u16 + 1,
+        "scan {}/{}{} · {} found · [S] stop",
+        scan.pinged(),
+        scan.total(),
+        baud,
         app.motors.len()
     );
     let gauge = Gauge::default()
@@ -335,7 +407,9 @@ fn draw_scan_gauge(f: &mut Frame, area: Rect, app: &App) {
         .ratio(scan.ratio())
         .label(Span::styled(
             label,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
     f.render_widget(gauge, area);
 }
@@ -348,7 +422,10 @@ fn draw_register_panel(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let regs = app.current_regs();
-    let header_style = Style::default().fg(Color::White).bg(HEADER_BG).add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(Color::White)
+        .bg(HEADER_BG)
+        .add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
         Cell::from("Addr").style(header_style),
         Cell::from("Item").style(header_style),
@@ -379,7 +456,10 @@ fn draw_register_panel(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let row_style = if app.reg_idx == i && focused {
-                Style::default().fg(Color::White).bg(ROW_HL).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .bg(ROW_HL)
+                    .add_modifier(Modifier::BOLD)
             } else if i % 2 == 0 {
                 Style::default().fg(Color::Gray).bg(Color::Rgb(20, 20, 28))
             } else {
@@ -460,17 +540,20 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let ctl = app.motor_control();
-    let deg_per_count = motor.model.map(|m| m.deg_per_count).unwrap_or(360.0 / 4096.0);
+    let deg_per_count = motor
+        .model
+        .map(|m| m.deg_per_count)
+        .unwrap_or(360.0 / 4096.0);
 
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // motor header
-            Constraint::Length(8),  // live readings
-            Constraint::Length(2),  // torque toggle
-            Constraint::Length(5),  // goal slider
-            Constraint::Length(2),  // danger buttons
-            Constraint::Min(2),     // hints
+            Constraint::Length(1), // motor header
+            Constraint::Length(8), // live readings
+            Constraint::Length(2), // torque toggle
+            Constraint::Length(5), // goal slider
+            Constraint::Length(2), // danger buttons
+            Constraint::Min(2),    // hints
         ])
         .split(inner);
 
@@ -478,7 +561,10 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
     let header = Line::from(vec![
         Span::styled(
             format!(" ID {} ", motor.id),
-            Style::default().fg(Color::White).bg(HEADER_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
@@ -486,7 +572,9 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
                 Some(m) => m.name.to_string(),
                 None => format!("Unknown ({:?})", motor.model_number),
             },
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
     f.render_widget(Paragraph::new(header), v[0]);
@@ -495,8 +583,14 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     let row = |label: &str, value: String, unit: &str| -> Line<'static> {
         Line::from(vec![
-            Span::styled(format!("{:<11}", label), Style::default().fg(Color::DarkGray)),
-            Span::styled(value, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:<11}", label),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                value,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" {}", unit), Style::default().fg(Color::Gray)),
         ])
     };
@@ -528,11 +622,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
             Some(RegType::U8) => 0.1,
             _ => 1.0,
         };
-        lines.push(row(
-            "Voltage",
-            format!("{:>5.2}", volt as f64 * scale),
-            "V",
-        ));
+        lines.push(row("Voltage", format!("{:>5.2}", volt as f64 * scale), "V"));
     }
     if let Some(t) = read(ctl.present_temperature) {
         lines.push(row("Temp", format!("{}", t), "°C"));
@@ -544,10 +634,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
             "",
         ));
     }
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        v[1],
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), v[1]);
 
     // Torque toggle
     let torque_state = read(ctl.torque_enable);
@@ -612,7 +699,11 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
         ]);
         let inner_v = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(v[3]);
         f.render_widget(Paragraph::new(header), inner_v[0]);
         f.render_widget(Paragraph::new(cur_line), inner_v[1]);
@@ -626,7 +717,9 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
             .ratio(goal_ratio)
             .label(Span::styled(
                 format!("{}", goal),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ));
         f.render_widget(gauge, inner_v[2]);
         add_zone(app, inner_v[0], Hit::EditGoal);
@@ -643,10 +736,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
 
     // Danger zone — Reboot + Factory Reset
     let danger_label = Line::from(vec![
-        Span::styled(
-            "Danger  ",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("Danger  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             " Reboot ",
             Style::default()
@@ -705,7 +795,9 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_edit_modal(f: &mut Frame, area: Rect, app: &App) {
-    let Some(edit) = app.editing.as_ref() else { return };
+    let Some(edit) = app.editing.as_ref() else {
+        return;
+    };
     let reg = app
         .current_regs()
         .iter()
@@ -716,7 +808,12 @@ fn draw_edit_modal(f: &mut Frame, area: Rect, app: &App) {
     let h = 7.min(area.height.saturating_sub(4));
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, popup);
 
     let title = match reg {
@@ -728,7 +825,10 @@ fn draw_edit_modal(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::White).bg(HEADER_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -740,8 +840,16 @@ fn draw_edit_modal(f: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("> ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(edit.buffer.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "> ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                edit.buffer.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("_", Style::default().fg(ACCENT)),
         ]),
     ])
@@ -767,7 +875,12 @@ fn draw_confirm_modal(f: &mut Frame, area: Rect, app: &App, action: ConfirmActio
     let h = 8.min(area.height.saturating_sub(4));
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -784,7 +897,12 @@ fn draw_confirm_modal(f: &mut Frame, area: Rect, app: &App, action: ConfirmActio
 
     let mut lines: Vec<Line> = body
         .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(Color::White),
+            ))
+        })
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -836,7 +954,10 @@ fn bordered_block(title: &str, focused: bool) -> Block<'_> {
         .border_style(Style::default().fg(if focused { ACCENT } else { Color::DarkGray }))
         .title(Span::styled(
             title.to_string(),
-            Style::default().fg(Color::White).bg(HEADER_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
         ))
 }
 
