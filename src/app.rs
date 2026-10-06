@@ -1113,7 +1113,13 @@ impl App {
         if self.bench_run.is_some() {
             return;
         }
-        self.bench_queue = BenchKind::ALL.to_vec();
+        // Fast Sync Read does not exist on protocol v1: leave those runs out.
+        let v2 = matches!(self.protocol, Protocol::V2);
+        self.bench_queue = BenchKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| v2 || !k.fast_sync())
+            .collect();
         let first = self.bench_queue.remove(0);
         self.start_bench(first);
     }
@@ -1132,6 +1138,11 @@ impl App {
         // Every benchmark except the pings needs a Present Position register.
         if !io.has_pos && !matches!(kind, BenchKind::PingOne | BenchKind::PingAll) {
             self.status = "No Present Position register on this model.".into();
+            self.bench_queue.clear();
+            return;
+        }
+        if kind.fast_sync() && !matches!(self.protocol, Protocol::V2) {
+            self.status = "Fast sync read needs protocol v2.".into();
             self.bench_queue.clear();
             return;
         }
@@ -1256,8 +1267,13 @@ impl App {
                     }
                 }
             }
-            BenchKind::ReadAllSync => {
-                match bus.sync_read(&run.ids, io.pos_addr, io.pos_ty.len()) {
+            BenchKind::ReadAllSync | BenchKind::ReadAllFastSync => {
+                let res = if run.kind.fast_sync() {
+                    bus.fast_sync_read(&run.ids, io.pos_addr, io.pos_ty.len())
+                } else {
+                    bus.sync_read(&run.ids, io.pos_addr, io.pos_ty.len())
+                };
+                match res {
                     Ok(v) if v.len() == run.ids.len() && v.iter().all(|b| !b.is_empty()) => {}
                     _ => errors += run.ids.len(),
                 }
@@ -1275,7 +1291,10 @@ impl App {
                     }
                 }
             }
-            BenchKind::RwHoldSync | BenchKind::RwSineSync => {
+            BenchKind::RwHoldSync
+            | BenchKind::RwSineSync
+            | BenchKind::RwHoldFastSync
+            | BenchKind::RwSineFastSync => {
                 let moving = run.kind.moving();
                 let goals: Vec<Vec<u8>> = (0..run.ids.len())
                     .map(|i| encode_value(run.goal(i, t, moving) as i64, io.goal_ty))
@@ -1283,7 +1302,12 @@ impl App {
                 if bus.sync_write(&run.ids, io.goal_addr, &goals).is_err() {
                     errors += 1;
                 }
-                match bus.sync_read(&run.ids, io.pos_addr, io.pos_ty.len()) {
+                let res = if run.kind.fast_sync() {
+                    bus.fast_sync_read(&run.ids, io.pos_addr, io.pos_ty.len())
+                } else {
+                    bus.sync_read(&run.ids, io.pos_addr, io.pos_ty.len())
+                };
+                match res {
                     Ok(v) if v.len() == run.ids.len() && v.iter().all(|b| !b.is_empty()) => {}
                     _ => errors += 1,
                 }
